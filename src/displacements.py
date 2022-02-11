@@ -206,3 +206,13 @@ def populate_field(rho, n_bins, box_size, density, key):
 
     coords = jnp.repeat(grid_centers, number_objects, axis=0) + displacements
     return (coords + box_size) % box_size
+
+
+def field_smooth(field, scale, box_size):
+    n_bins = field.shape[0]
+    k = jnp.fft.fftfreq(n_bins, d=box_size/n_bins) * 2 * jnp.pi
+    kr = k * scale
+
+    norm = jnp.exp(-0.5 * (kr[:, None, None] ** 2 + kr[None, :, None] ** 2 + kr[None, None, :n_bins//2+1] ** 2))
+    
+    return jnp.fft.irfftn(norm * jnp.fft.rfftn(field), field.shape)
