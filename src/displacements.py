@@ -1,5 +1,14 @@
 import jax
 import jax.numpy as jnp
+import sys
+sys.path.insert(0, "/global/u1/d/dforero/projects/jax-powspec") #Use my local jax_cosmo with correlations module
+from jax_powspec.mas import cic_mas_vec
+import jax_cosmo as jc
+
+def get_k(n_bins, box_size):
+    k = jnp.fft.fftfreq(n_bins, d=box_size/n_bins) * 2 * jnp.pi
+    return k
+
 
 @jax.jit
 def divergence_to_displacement(divergence, box_size, smooth):
@@ -216,3 +225,259 @@ def field_smooth(field, scale, box_size):
     norm = jnp.exp(-0.5 * (kr[:, None, None] ** 2 + kr[None, :, None] ** 2 + kr[None, None, :n_bins//2+1] ** 2))
     
     return jnp.fft.irfftn(norm * jnp.fft.rfftn(field), field.shape)
+
+
+
+# JAX PM
+def inv_laplacian_k(k):
+    n_bins = k.shape[0]
+    ksq = k[:,None,None]**2 + k[None,:,None]**2 + k[None,None,:n_bins // 2 + 1]**2
+    return jnp.where(ksq == 0., 1., 1. / ksq)
+
+def gradient_ki(ki, order):
+    
+    def order_0_fun(ki):
+        return 1j * ki
+    def order_not_0_fun(ki):
+        a = 1 / 6.0 * (8 * jnp.sin(ki) - jnp.sin(2 * ki))
+        return 1j * a
+    
+    return jax.lax.cond(order == 0, order_0_fun, order_not_0_fun, ki)
+
+def long_range_k(ksq, r_split):
+    
+    return jax.lax.cond(r_split==0, lambda ksq, r: jnp.broadcast_to([1.], ksq.shape), lambda ksq, r: jnp.exp(- ksq * r**2), ksq, r_split)
+
+@jax.jit
+def cic_interpolate(field, particles, box_size, n_bins):
+    
+    connection = jnp.array([[[0, 0, 0], [1., 0, 0], [0., 1, 0], [0., 0, 1], [1., 1, 0],
+                      [1., 0, 1], [0., 1, 1], [1., 1, 1]]]).squeeze()
+    floor = jnp.floor(particles) * n_bins // box_size
+    part = particles * n_bins / box_size
+    neighbors = floor[:,None,:] + connection[None,...]
+    kernel = 1. - jnp.abs(part[:,None,:] - neighbors)    
+    kernel = kernel[...,0] * kernel[...,1] * kernel[...,2]
+    neighbors = neighbors.astype(jnp.int32)
+    neighbors %= n_bins
+    field_eval = field[neighbors[...,0].reshape(-1), neighbors[...,1].reshape(-1), neighbors[...,2].reshape(-1)].reshape(-1, 8) * kernel
+    return field_eval.sum(axis=-1)
+@jax.jit
+def apply_longrange(positions,
+                    delta_k,
+                    box_size,
+                    split,
+                    factor,
+                    ki):
+    
+    n_bins = delta_k.shape[0]
+    ksq = ki[:,None,None]**2 + ki[None,:,None]**2 + ki[None,None,:n_bins//2+1]**2
+    inv_laplace = inv_laplacian_k(ki)
+    smoothing = long_range_k(ksq, split)
+    pot_k = delta_k * inv_laplace * smoothing
+    forces = jnp.empty_like(positions)
+    
+    forces = forces.at[:,0].set(cic_interpolate(jnp.fft.irfftn(pot_k * gradient_ki(ki[:,None,None], 1), (n_bins, n_bins, n_bins)), positions, box_size, n_bins))
+    forces = forces.at[:,1].set(cic_interpolate(jnp.fft.irfftn(pot_k * gradient_ki(ki[None,:,None], 1), (n_bins, n_bins, n_bins)), positions, box_size, n_bins))
+    forces = forces.at[:,2].set(cic_interpolate(jnp.fft.irfftn(pot_k * gradient_ki(ki[None,None,:n_bins//2 + 1], 1), (n_bins, n_bins, n_bins)), positions, box_size, n_bins))
+    
+    return forces * factor
+    
+    
+    
+def force(cosmo, particles, n_bins, box_size, **kwargs):
+    
+    
+    rho = jnp.zeros((n_bins, n_bins, n_bins))
+    w0 = jnp.broadcast_to([1.], particles.shape[0])
+    rho = cic_mas_vec(rho,
+                    particles[:,0], particles[:,1], particles[:,2], w0, 
+                    particles.shape[0], 
+                    0., 0., 0.,
+                    box_size,
+                    n_bins,
+                    True)
+    rho /= rho.mean()
+    ki = get_k(n_bins, box_size)
+    delta_k = jnp.fft.rfftn(rho)
+    fac = 1.5 * cosmo.Omega_m
+    forces = apply_longrange(particles, delta_k, box_size, 0., fac, ki)
+        
+    return forces
+    
+    
+def kick(cosmo, forces, ai, ac, af, **kwargs):
+    Ei = jnp.sqrt(jc.background.Esqr(cosmo, jnp.atleast_1d(ai)))
+    Ef = jnp.sqrt(jc.background.Esqr(cosmo, jnp.atleast_1d(af)))
+    Ec = jnp.sqrt(jc.background.Esqr(cosmo, jnp.atleast_1d(ac)))
+    D1fi = jc.background.growth_rate(cosmo, jnp.atleast_1d(ai)) / ai
+    D1ff = jc.background.growth_rate(cosmo, jnp.atleast_1d(af)) / af
+    D1fc = jc.background.growth_rate(cosmo, jnp.atleast_1d(ac)) / ac
+    
+    D1c = jc.background.growth_factor(cosmo, jnp.atleast_1d(ac))
+    
+    
+    Omega_m_ac = jc.background.Omega_m_a(cosmo, jnp.atleast_1d(ac))
+    Omega_de_ac = jc.background.Omega_de_a(cosmo, jnp.atleast_1d(ac))
+    
+    F1pc = 1.5 * Omega_m_ac * D1c / ac**2 - (D1fc / ac) * (
+      Omega_de_ac - 0.5 * Omega_m_ac + 2) / jc.background.growth_factor(cosmo, jnp.atleast_1d(1.))[0]
+    
+    Gfi = D1fi * ai**3 * Ei
+    Gff = D1ff * af**3 * Ef
+    
+    fdec = jc.background.f_de(cosmo, jnp.atleast_1d(ac))
+    epsilon = 1e-5
+    dfdec = (3 * cosmo.wa * (jnp.log(ac - epsilon) - (ac - 1) / (ac - epsilon)) /
+          jnp.power(jnp.log(ac - epsilon), 2))
+    
+    dEac = 0.5 * (-3 * cosmo.Omega_m / ac**4 -
+                2 * cosmo.Omega_k / ac**3 + dfdec *
+                cosmo.Omega_de * jnp.power(ac, fdec)) / Ec
+    
+    gfc = (F1pc * ac**3 * Ec + D1fc * ac**3 * dEac +
+          3 * ac**2 * Ec * D1fc)
+    fac = 1 / (ac**2 * Ec) * (Gff - Gfi) / gfc
+    
+    return fac * forces
+
+
+def drift(cosmo, momenta, ai, ac, af):
+  
+    
+    Ec = jnp.sqrt(jc.background.Esqr(cosmo, jnp.atleast_1d(ac)))
+    D1fc = jc.background.growth_rate(cosmo, jnp.atleast_1d(ac)) / ac
+    
+    D1i = jc.background.growth_factor(cosmo, jnp.atleast_1d(ai))
+    D1f = jc.background.growth_factor(cosmo, jnp.atleast_1d(af))
+    fac = 1. / (ac**3 * Ec) * (D1f - D1i) / D1fc
+    
+    
+    return fac * momenta
+
+
+    
+    
+def lpt_init(cosmo, linear, a, box_size, n_bins):
+    
+    state = {}
+    
+    pos_lagrangian = jnp.arange(0, box_size, box_size / n_bins)
+    pos_lagrangian = jnp.array(jnp.meshgrid(pos_lagrangian, pos_lagrangian, pos_lagrangian)).reshape(3, n_bins**3).T
+    
+    D1 = jc.background.growth_factor(cosmo, jnp.atleast_1d(a))[0]
+    f1 = jc.background.growth_rate(cosmo, jnp.atleast_1d(a))[0]
+    E = jc.background.Esqr(cosmo, jnp.atleast_1d(a))[0]**0.5
+    Omega_m_a = jc.background.Omega_m_a(cosmo, jnp.atleast_1d(a))
+    Omega_de_a = jc.background.Omega_de_a(cosmo, jnp.atleast_1d(a))
+    fde = jc.background.f_de(cosmo, jnp.atleast_1d(a))
+    D1f = f1 / a
+    
+    
+    F1p = 1.5 * Omega_m_a * D1 / a**2 - (D1f / a) * (
+      Omega_de_a - 0.5 * Omega_m_a + 2) / jc.background.growth_factor(cosmo, jnp.atleast_1d(1.))[0]
+    
+    
+    epsilon = 1e-5
+    dfde = (3 * cosmo.wa * (jnp.log(a - epsilon) - (a - 1) / (a - epsilon)) /
+          jnp.power(jnp.log(a - epsilon), 2))
+    
+    dEa = 0.5 * (-3 * cosmo.Omega_m / a**4 -
+                2 * cosmo.Omega_k / a**3 + dfde *
+                cosmo.Omega_de * jnp.power(a, fde)) / E
+    
+    gf = (F1p * a**3 * E + D1f * a**3 * dEa +
+          3 * a**2 * E * D1f)
+    
+    
+    
+    displacements = zeldovich(linear, box_size, 0.)
+    psi = D1 * \
+            jnp.c_[cic_interpolate(displacements[0], pos_lagrangian, box_size, n_bins), \
+                   cic_interpolate(displacements[1], pos_lagrangian, box_size, n_bins), \
+                   cic_interpolate(displacements[2], pos_lagrangian, box_size, n_bins)]
+    del displacements
+    
+    state['momenta'] = a**2 * f1 * E * psi
+    state['forces' ] = a**2 * E * gf / D1 * psi
+    state['positions'] = pos_lagrangian + psi
+    
+    return state
+    
+    
+    
+    
+    
+    
+def nbody(cosmo,
+          state,
+          stages,
+          n_bins,
+          box_size):
+  
+    
+    ai = stages[0]
+
+    # first force calculation for jump starting
+    state['forces'] = force(cosmo, state['positions'], n_bins, box_size)
+    
+
+    x, p, f = ai, ai, ai
+    
+    xs = jnp.arange(stages.shape[0] - 1)
+    init = (state, x, p, f, stages)
+    def scan_func(carry, i):
+        state, x, p, f, stages = carry
+        
+        a0 = stages[i]
+        a1 = stages[i + 1]
+        ah = (a0 * a1)**0.5
+        state['momenta'] += kick(cosmo, state['forces'], p, f, ah)
+        p = ah
+
+      # Drift step
+        state['positions'] += drift(cosmo, state['momenta'], x, p, a1)
+      # Optional PGD correction step
+        
+        x = a1
+
+      # Force
+        state['forces'] = force(cosmo, state['positions'], n_bins, box_size)
+        f = a1
+
+      # Kick again
+        state['momenta'] += kick(cosmo, state['forces'], p, f, a1)
+        p = a1
+        
+        return carry, None
+      
+    #(state, _, _, _, _), _ = jax.lax.scan(scan_func, init, xs)
+    #return state
+    # Loop through the stages
+    for i in range(len(stages) - 1):
+        a0 = stages[i]
+        a1 = stages[i + 1]
+        ah = (a0 * a1)**0.5
+        print(state['positions'])
+      # Kick step
+        state['momenta'] += kick(cosmo, state['forces'], p, f, ah)
+        p = ah
+
+      # Drift step
+        state['positions'] += drift(cosmo, state['momenta'], x, p, a1) + box_size
+        state['positions'] %= box_size
+      # Optional PGD correction step
+        
+        x = a1
+
+      # Force
+        state['forces'] = force(cosmo, state['positions'], n_bins, box_size)
+        f = a1
+
+      # Kick again
+        state['momenta'] += kick(cosmo, state['forces'], p, f, a1)
+        p = a1
+        
+
+    
+    return state

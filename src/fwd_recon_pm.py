@@ -24,6 +24,9 @@ import MAS_library as MASL
 import Pk_library as PKL
 #jax.config.update("jax_debug_nans", True)
 
+
+
+
 box_size = 2000.
 data_fn = "/pscratch/sd/d/dforero/projects/fwd-recon/data/CATALPTCICz0.466G960S1005638091.dat"
 fig, ax = pplt.subplots(nrows=4, ncols=3, sharex=False, sharey=False)
@@ -52,6 +55,8 @@ interp_smooth=4.
 klin = np.logspace(-3, 0, 2048)
 plin_i = jc.power.linear_matter_power(cosmo, klin, a = 1. / (1 + z_init), transfer_fn=jc.transfer.Eisenstein_Hu)
 
+
+
 # Build observed delta field
 delta_now = jnp.zeros((n_bins, n_bins, n_bins))
 delta_now = cic_mas_vec(delta_now,
@@ -72,20 +77,22 @@ pk_now = pk_now.at[:,0].set(pk_now[:,0] - shot_noise)
 
 # Build delta field of initial condition
 
-delta_init = delta_now / bias / growth_factor
+#delta_init = delta_now / bias / growth_factor
+key, subkey = jax.random.split(key)
+delta_init = displacements.gaussian_field(n_bins, klin, plin_i, 0, 
+                      subkey, box_size)
 
 k, pk_init, _ = powspec_vec(delta_init, box_size, k_edges)
 s, xi_init, _ = xi_vec(delta_init, box_size, s_edges)
 
 # Init lagrangian positions
 
-pos_lagrangian = jnp.arange(0, box_size, box_size / n_bins)
+pos_lagrangian = jnp.arange(0, n_bins)
 pos_lagrangian = jnp.array(jnp.meshgrid(pos_lagrangian, pos_lagrangian, pos_lagrangian)).reshape(3, n_bins**3).T
 
 
+
 shot_noise = pos_lagrangian.shape[0] / box_size**3
-
-
 
 
 ax[0].imshow(delta_init.mean(axis=0), colorbar='right')
@@ -98,48 +105,17 @@ ax[6].plot(s, s**2*xi_now[:,0], label='Now')
 ax[7].plot(s, s**2*(bias**2 * growth_rate**2 * xi_init[:,0]), label='b^2D^2 Init')
 
 
-def evolve_lagrangian_disp(pos_lagrangian, disp, growth_factor):
-    pos = pos_lagrangian.copy()
-    psi_x, psi_y, psi_z = disp
-    #psi_x, psi_y, psi_z = displacements.aug_lpt(delta, box_size, smooth, interp_smooth)
-    pos = jax.ops.index_add(pos, jax.ops.index[:,0], growth_factor * displacements.interpolate_field(psi_x, pos_lagrangian, 0., 0., 0., n_bins, box_size))
-    pos = jax.ops.index_add(pos, jax.ops.index[:,1], growth_factor * displacements.interpolate_field(psi_y, pos_lagrangian, 0., 0., 0., n_bins, box_size))
-    pos = jax.ops.index_add(pos, jax.ops.index[:,2], growth_factor * displacements.interpolate_field(psi_z, pos_lagrangian, 0., 0., 0., n_bins, box_size))
+#fig.savefig("plots/fwd_recon_pm.pdf", dpi=300); exit()
 
-    pos = (pos + box_size) % box_size
-    
-    del psi_x
-    del psi_y
-    del psi_z
-
-    # Build field evolved from lagrangian positions
-    delta_ev = jnp.zeros((n_bins, n_bins, n_bins))
-    delta_ev = cic_mas_vec(delta_ev,
-                    pos[:,0], pos[:,1], pos[:,2], jnp.broadcast_to([1.], pos.shape[0]), 
-                    pos.shape[0], 
-                    0., 0., 0.,
-                    box_size,
-                    n_bins,
-                    True)
-    delta_ev /= delta_ev.mean()
-    delta_ev -= 1.
-    return delta_ev
 
 
 def evolve_lagrangian(pos_lagrangian, delta, growth_factor):
-    pos = pos_lagrangian.copy()
-    psi_x, psi_y, psi_z = displacements.zeldovich(delta, box_size, smooth)
-    #psi_x, psi_y, psi_z = displacements.two_lpt(delta, box_size, smooth)
-    #spsi_x, psi_y, psi_z = displacements.aug_lpt(delta, box_size, smooth, interp_smooth)
-    pos = jax.ops.index_add(pos, jax.ops.index[:,0], growth_factor * displacements.interpolate_field(psi_x, pos_lagrangian, 0., 0., 0., n_bins, box_size))
-    pos = jax.ops.index_add(pos, jax.ops.index[:,1], growth_factor * displacements.interpolate_field(psi_y, pos_lagrangian, 0., 0., 0., n_bins, box_size))
-    pos = jax.ops.index_add(pos, jax.ops.index[:,2], growth_factor * displacements.interpolate_field(psi_z, pos_lagrangian, 0., 0., 0., n_bins, box_size))
 
-    pos = (pos + box_size) % box_size
     
-    del psi_x
-    del psi_y
-    del psi_z
+    state = displacements.lpt_init(cosmo, delta_init, 1. / (1. + z_init), n_bins, n_bins)
+    stages = np.linspace(1. / (1. + z_init), 1. / (1. + z), 20, endpoint=True)
+    state = displacements.nbody(cosmo, state, stages, n_bins, n_bins)
+    pos = state['positions'] * box_size / n_bins
 
     # Build field evolved from lagrangian positions
     delta_ev = jnp.zeros((n_bins, n_bins, n_bins))
@@ -152,7 +128,7 @@ def evolve_lagrangian(pos_lagrangian, delta, growth_factor):
                     True)
     delta_ev /= delta_ev.mean()
     delta_ev -= 1.
-    return delta_ev
+    return delta_ev * growth_factor
 
 #delta_ev = bias * evolve_lagrangian_disp(pos_lagrangian, displacements.zeldovich(delta_init, box_size, smooth), growth_factor)
 delta_ev = bias * evolve_lagrangian(pos_lagrangian, delta_init, growth_factor)
@@ -163,10 +139,13 @@ ax[4].plot(k, pk_ev[:,0], label='Ev. Zeld.', ls='--')
 ax[6].plot(s, s**2*xi_ev[:,0], label='Ev. Zeld.', ls = '--')
 
 ax[4].format(xscale='log', yscale='log')
-#ax[4].legend(loc='top')
-#ax[6].legend(loc='top')
+ax[4].legend(loc='top')
+ax[6].legend(loc='top')
 
-#fig.savefig("plots/fwd_recon.png", dpi=300); exit()
+ax[1].imshow(delta_ev.mean(axis=0), colorbar='right')
+ax[1].format(title='Evolved')
+
+fig.savefig("plots/fwd_recon_pm.pdf", dpi=300); exit()
 #@jax.jit
 
 
