@@ -27,7 +27,7 @@ import Pk_library as PKL
 
 
 
-box_size = 2000.
+box_size = 1800.
 data_fn = "/pscratch/sd/d/dforero/projects/fwd-recon/data/CATALPTCICz0.466G960S1005638091.dat"
 fig, ax = pplt.subplots(nrows=4, ncols=3, sharex=False, sharey=False)
 particles = jax.device_put(pd.read_csv(data_fn, delim_whitespace=True, engine='c', usecols=(0,1,2)).values)
@@ -40,8 +40,8 @@ w0 = jnp.ones(particles.shape[0])
 
 shot_noise = box_size**3 / n_part
 z = 0.466
-z_init = 100.
-n_bins = 300
+z_init = 10.
+n_bins = 150
 bias = 2.
 growth_rate = jc.background.growth_rate(cosmo, jnp.atleast_1d(1. / (1 + z)))[0]
 growth_factor = jc.background.growth_factor(cosmo, jnp.atleast_1d(1. / (1 + z)))[0] / jc.background.growth_factor(cosmo, jnp.atleast_1d(1. / (1 + z_init)))[0]
@@ -53,7 +53,7 @@ s_edges = jnp.linspace(5, 200, 41)
 smooth=0.
 interp_smooth=4.
 klin = np.logspace(-3, 0, 2048)
-plin_i = jc.power.linear_matter_power(cosmo, klin, a = 1. / (1 + z_init), transfer_fn=jc.transfer.Eisenstein_Hu)
+plin_i = jc.power.linear_matter_power(cosmo, klin, a = 1. / (1 + 0), transfer_fn=jc.transfer.Eisenstein_Hu)
 
 
 
@@ -77,22 +77,13 @@ pk_now = pk_now.at[:,0].set(pk_now[:,0] - shot_noise)
 
 # Build delta field of initial condition
 
-#delta_init = delta_now / bias / growth_factor
-key, subkey = jax.random.split(key)
-delta_init = displacements.gaussian_field(n_bins, klin, plin_i, 0, 
-                      subkey, box_size)
+delta_init = delta_now / bias #/ growth_factor
+#key, subkey = jax.random.split(key)
+#delta_init = displacements.gaussian_field(n_bins, klin, plin_i, 0, 
+#                      subkey, box_size)
 
 k, pk_init, _ = powspec_vec(delta_init, box_size, k_edges)
 s, xi_init, _ = xi_vec(delta_init, box_size, s_edges)
-
-# Init lagrangian positions
-
-pos_lagrangian = jnp.arange(0, n_bins)
-pos_lagrangian = jnp.array(jnp.meshgrid(pos_lagrangian, pos_lagrangian, pos_lagrangian)).reshape(3, n_bins**3).T
-
-
-
-shot_noise = pos_lagrangian.shape[0] / box_size**3
 
 
 ax[0].imshow(delta_init.mean(axis=0), colorbar='right')
@@ -107,14 +98,21 @@ ax[7].plot(s, s**2*(bias**2 * growth_rate**2 * xi_init[:,0]), label='b^2D^2 Init
 
 #fig.savefig("plots/fwd_recon_pm.pdf", dpi=300); exit()
 
+# Init lagrangian positions
+
+pos_lagrangian = jnp.arange(0, n_bins)
+pos_lagrangian = jnp.array(jnp.meshgrid(pos_lagrangian, pos_lagrangian, pos_lagrangian)).reshape(3, n_bins**3).T
 
 
-def evolve_lagrangian(pos_lagrangian, delta, growth_factor):
 
-    
-    state = displacements.lpt_init(cosmo, delta_init, 1. / (1. + z_init), n_bins, n_bins)
-    stages = np.linspace(1. / (1. + z_init), 1. / (1. + z), 20, endpoint=True)
-    state = displacements.nbody(cosmo, state, stages, n_bins, n_bins)
+shot_noise = pos_lagrangian.shape[0] / box_size**3
+
+def evolve_lagrangian(pos_lagrangian, delta, rho, pm_steps):
+
+    n_bins = rho.shape[0]
+    state = displacements.lpt_init(cosmo, delta, 1. / (1. + z_init), pos_lagrangian, n_bins, n_bins)
+    stages = jnp.linspace(1. / (1. + z_init), 1. / (1. + z), pm_steps, endpoint=True)
+    state = displacements.nbody(cosmo, state, stages, rho, n_bins, n_bins)
     pos = state['positions'] * box_size / n_bins
 
     # Build field evolved from lagrangian positions
@@ -128,31 +126,32 @@ def evolve_lagrangian(pos_lagrangian, delta, growth_factor):
                     True)
     delta_ev /= delta_ev.mean()
     delta_ev -= 1.
-    return delta_ev * growth_factor
+    return delta_ev
 
 #delta_ev = bias * evolve_lagrangian_disp(pos_lagrangian, displacements.zeldovich(delta_init, box_size, smooth), growth_factor)
-delta_ev = bias * evolve_lagrangian(pos_lagrangian, delta_init, growth_factor)
+rho = jnp.zeros(delta_init.shape)
+delta_ev = evolve_lagrangian(pos_lagrangian, delta_init, rho, 10)
 k, pk_ev, _ = powspec_vec(delta_ev, box_size, k_edges)
 pk_ev = pk_ev.at[:,0].set(pk_ev[:,0] - shot_noise)
 s, xi_ev, _ = xi_vec(delta_ev, box_size, s_edges)
 ax[4].plot(k, pk_ev[:,0], label='Ev. Zeld.', ls='--')
 ax[6].plot(s, s**2*xi_ev[:,0], label='Ev. Zeld.', ls = '--')
 
-ax[4].format(xscale='log', yscale='log')
-ax[4].legend(loc='top')
-ax[6].legend(loc='top')
+#ax[4].format(xscale='log', yscale='log')
+#ax[4].legend(loc='top')
+#ax[6].legend(loc='top')
 
-ax[1].imshow(delta_ev.mean(axis=0), colorbar='right')
-ax[1].format(title='Evolved')
+#ax[1].imshow(delta_ev.mean(axis=0), colorbar='right', vmin = -0.5, vmax = 0.9)
+#ax[1].format(title='Evolved')
 
-fig.savefig("plots/fwd_recon_pm.pdf", dpi=300); exit()
+#fig.savefig("plots/fwd_recon_pm.pdf", dpi=300); exit()
 #@jax.jit
+del delta_ev
 
-
-def loss(conv_kernel, delta_init):
-    
+def loss(params, delta_init):
+    lin_bias, conv_kernel = params
     init = jnp.fft.irfftn(conv_kernel * jnp.fft.rfftn(delta_init), delta_init.shape)
-    delta_ev = bias * evolve_lagrangian(pos_lagrangian, init, growth_factor)
+    delta_ev = lin_bias * evolve_lagrangian(pos_lagrangian, init, jnp.zeros_like(init), 10)
 
     k, pk_ev, _ = powspec_vec(delta_ev, box_size, k_edges)
     pk_ev = pk_ev.at[:,0].set(pk_ev[:,0] - shot_noise)
@@ -173,7 +172,7 @@ learning_rate = 1e-1
 opt_init, opt_update, get_params = optimizers.adam(learning_rate)
 conv_kernel = jnp.ones((n_bins, n_bins, n_bins//2 + 1))
 
-opt_state = opt_init(conv_kernel)
+opt_state = opt_init((bias, conv_kernel))
 
 
 @jax.jit
@@ -181,7 +180,7 @@ def step(step, opt_state):
     grads = jax.grad(loss)(get_params(opt_state), delta_init)
     opt_state = opt_update(step, grads, opt_state)
     return opt_state
-num_steps = 200
+num_steps = 100
 
 
 
@@ -191,12 +190,12 @@ opt_state = jax.lax.fori_loop(0, num_steps, step, opt_state)
 print(f"Training took {time.time() - s} s", flush=True)
 
 
-new_conv_kernel = get_params(opt_state)
+bias, new_conv_kernel = get_params(opt_state)
 
 delta_init = jnp.fft.irfftn(new_conv_kernel * jnp.fft.rfftn(delta_init), delta_init.shape)
 k, pk_init, _ = powspec_vec(delta_init, box_size, k_edges)
 s, xi_init, _ = xi_vec(delta_init, box_size, s_edges)
-delta_ev = bias * evolve_lagrangian(pos_lagrangian, delta_init, growth_factor)
+delta_ev = bias * evolve_lagrangian(pos_lagrangian, delta_init, jnp.zeros_like(delta_init), 10)
 k, pk_ev, _ = powspec_vec(delta_ev, box_size, k_edges)
 pk_ev = pk_ev.at[:,0].set(pk_ev[:,0] - shot_noise)
 s, xi_ev, _ = xi_vec(delta_ev, box_size, s_edges)
@@ -216,13 +215,13 @@ ax[5].format(title='Difference')
 ax[4].plot(k, pk_init[:,0], label='Init Corrected')
 ax[4].plot(k, pk_ev[:,0], label='Evolved Lag.', ls = '--')
 
-ax[7].plot(s, s**2*(bias**2 * growth_rate**2 * xi_init[:,0]), label='b^2D^2 Init Corrected')
+ax[7].plot(s, s**2*(growth_rate**2 * xi_init[:,0]), label='b^2D^2 Init Corrected')
 ax[6].plot(s, s**2*xi_ev[:,0], label='Evolved Lag.', ls = '--')
 
 ax[4].format(xscale='log', yscale='log')
 ax[4].legend(loc='top')
 ax[6].legend(loc='top')
 ax[7].legend(loc='top')
-ax[8].imshow(jnp.fft.irfftn(new_conv_kernel, delta_init.shape).mean(axis=1), colorbar='right', norm='symlog')
+ax[8].imshow(new_conv_kernel.mean(axis=2), colorbar='right', norm='symlog')
 ax[8].format(title='Kernel')
-fig.savefig("plots/fwd_recon.pdf", dpi=300)
+fig.savefig("plots/fwd_recon_pm.pdf", dpi=300)
